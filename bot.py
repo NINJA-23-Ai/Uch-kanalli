@@ -512,15 +512,29 @@ def normalize_country(value: Any) -> str:
     return ", ".join(unique) or AI_DEFAULT_METADATA["countries"]
 
 
-def normalize_cast(value: Any) -> str:
+def _normalize_people(value: Any, default: str) -> str:
     parts = _safe_literal_list(value)
     if parts is None:
         text = clean_text_output(value)
-        parts = [p for p in re.split(r"\s*,\s*", text) if p.strip()]
+        parts = [p for p in re.split(r"\s*,\s*|\s+va\s+|\s+and\s+", text, flags=re.IGNORECASE) if p.strip()]
 
-    cleaned = [clean_text_output(part) for part in parts]
-    cleaned = [part for part in cleaned if part]
-    return ", ".join(cleaned) or AI_DEFAULT_METADATA["cast"]
+    cleaned: List[str] = []
+    noise = re.compile(r"\b(actors?|cast|starring|director|rejissyor|bosh rollar|rollarda|noma'lum|unknown)\b", re.IGNORECASE)
+    for part in parts:
+        name = noise.sub(" ", clean_text_output(part))
+        name = re.sub(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҒғҚқҲҳЎўʻ‘’'\.\-\s]", " ", name)
+        name = re.sub(r"\s+", " ", name).strip(" -,.:")
+        if name and name.lower() not in {"n/a", "none", "null"} and name not in cleaned:
+            cleaned.append(name)
+    return ", ".join(cleaned[:8]) or default
+
+
+def normalize_cast(value: Any) -> str:
+    return _normalize_people(value, AI_DEFAULT_METADATA["cast"])
+
+
+def normalize_director(value: Any) -> str:
+    return _normalize_people(value, AI_DEFAULT_METADATA["director"])
 
 
 def normalize_genres(value: Any) -> str:
@@ -569,7 +583,7 @@ def _normalize_ai_metadata(raw: Any) -> Dict[str, str]:
     meta["year"] = clean_text_output(meta.get("year")) or AI_DEFAULT_METADATA["year"]
     meta["rating"] = clean_text_output(meta.get("rating")) or AI_DEFAULT_METADATA["rating"]
     meta["genres"] = normalize_genres(meta.get("genres"))
-    meta["director"] = clean_text_output(meta.get("director")) or AI_DEFAULT_METADATA["director"]
+    meta["director"] = normalize_director(meta.get("director"))
     meta["cast"] = normalize_cast(meta.get("cast"))
 
     desc = clean_text_output(meta.get("description"))
@@ -602,8 +616,11 @@ def normalize_detected_title(title: str) -> str:
     text = clean_text_output(title)
     text = re.sub(r"\[[^\]]+\]", " ", text)
     text = re.sub(r"\{[^}]+\}", " ", text)
-    text = re.sub(r"\b(official|poster|trailer|treyler|teaser|uzbek|o'zbek|uzbekcha|tarjima|dublyaj|kino|film|full|hd|4k|1080p|720p)\b", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(uzmovi|uzmovie|asilmedia|tas-ix|premyera|premiere|yangi)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[|/]+.*$", " ", text)
+    text = re.sub(r"\b(official|poster|trailer|treyler|teaser|uzbek|o'zbek|uzbekcha|tarjima|dublyaj|kino|film|full|hd|4k|1080p|720p|2160p|webrip|bluray|hdrip)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(uzmovi|uzmovie|asilmedia|tas-ix|premyera|premiere|yangi|kanalimizda|tomosha|ko'ring|korish)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d+\s*[- ]?qism\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(season|mavsum|episode|seriya)\s*\d+\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bchapter\s+([ivxlcdm]+|\d+)\b", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\bpart\s+([ivxlcdm]+|\d+)\b", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\((19|20)\d{2}\)", " ", text)
@@ -703,7 +720,7 @@ def _ai_update_session(chat_id: int, **kwargs: Any) -> Dict[str, Any]:
 
 
 def _ai_reset_session_for_new_poster(chat_id: int, message_id: int) -> None:
-    ai_channel_session[int(chat_id)] = {"poster_message_id": int(message_id), "ts": time.time(), "episodes": {}}
+    ai_channel_session[int(chat_id)] = {"poster_message_id": int(message_id), "ts": time.time(), "episodes": {}, "ai_phase": "awaiting_type"}
 
 
 def _publish_confirm_kb(kind: str, code: str) -> types.InlineKeyboardMarkup:
@@ -774,6 +791,26 @@ def _current_ai_metadata(chat_id: int) -> Optional[Dict[str, str]]:
     if not isinstance(session, dict):
         return None
     return session.get("metadata") if isinstance(session.get("metadata"), dict) else None
+
+
+async def _resolve_ai_metadata_for_message(message: types.Message, allow_vision: bool = False) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    metadata = _current_ai_metadata(message.chat.id)
+    if metadata:
+        meta = _normalize_ai_metadata(metadata)
+        if meta.get("title") and meta.get("title") != AI_DEFAULT_METADATA["title"]:
+            return meta, None
+
+    title = parse_title_from_manual_caption(message.caption or "")
+    if title and title != AI_DEFAULT_METADATA["title"]:
+        fallback = metadata_lookup_by_title(title)
+        _save_ai_metadata(message.chat.id, message.message_id, fallback, source="fallback", confidence=verify_metadata_confidence(fallback))
+        return fallback, None
+
+    if allow_vision and message.photo:
+        meta, error_text, _ = await fallback_vision_if_missing(message, metadata or {})
+        return meta, error_text
+
+    return None, 'Cached title topilmadi. Avval poster ostidagi "🎬 Film postini yozish" tugmasini bosing. Vision qayta chaqirilmadi.'
 
 
 def _save_ai_metadata(chat_id: int, message_id: int, metadata: Dict[str, str], source: str = "ai", confidence: Optional[str] = None) -> None:
@@ -978,15 +1015,20 @@ def ai_name_kb(message_id: int) -> types.InlineKeyboardMarkup:
 
 
 def ai_video_kb(message: types.Message) -> types.InlineKeyboardMarkup:
+    session = ai_channel_session.get(int(message.chat.id))
+    phase = session.get("ai_phase") if isinstance(session, dict) else None
+    if phase == "awaiting_trailer":
+        return ai_trailer_kb(message.message_id)
+
+    caption = (message.caption or "").lower()
+    if "treyler" in caption or "trailer" in caption:
+        return ai_trailer_kb(message.message_id)
+
     ctype = _ai_content_type(message.chat.id)
     if ctype == "movie":
         return ai_name_kb(message.message_id)
     if ctype == "series":
         return ai_name_kb(message.message_id)
-
-    caption = (message.caption or "").lower()
-    if "treyler" in caption or "trailer" in caption:
-        return ai_trailer_kb(message.message_id)
 
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -1082,7 +1124,7 @@ async def ai_choose_content_type(call: types.CallbackQuery):
         return
 
     content_type = parts[2]
-    _ai_update_session(call.message.chat.id, content_type=content_type)
+    _ai_update_session(call.message.chat.id, content_type=content_type, ai_phase="awaiting_poster_post")
 
     try:
         if call.message.photo:
@@ -1109,13 +1151,20 @@ async def ai_manual_mode(call: types.CallbackQuery):
         return
 
     await _remove_inline_buttons(call.message)
+    action = call.data.split(":")[2] if len(call.data.split(":")) > 2 else ""
     title = parse_title_from_manual_caption(call.message.caption or "")
     if title:
         metadata = manual_session_cache(call.message.chat.id, call.message.message_id, call.message.caption or "")
         if call.message.photo:
-            _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id, poster_caption=call.message.caption or "")
+            _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id, poster_caption=call.message.caption or "", ai_phase="awaiting_trailer")
+        elif call.message.video and action == "trailer":
+            _ai_update_session(call.message.chat.id, trailer={"from_chat_id": call.message.chat.id, "message_id": call.message.message_id}, trailer_caption=call.message.caption or "", ai_phase="awaiting_video")
+        elif call.message.video and action == "name":
+            _ai_update_session(call.message.chat.id, ai_phase="naming_done")
         await call.answer(f"✅ Manual title saqlandi: {metadata.get('title', title)}", show_alert=True)
     else:
+        if call.message.video and action == "trailer":
+            _ai_update_session(call.message.chat.id, trailer={"from_chat_id": call.message.chat.id, "message_id": call.message.message_id}, trailer_caption=call.message.caption or "", ai_phase="awaiting_video")
         await call.answer("✅ Qo‘lda yozish rejimi tanlandi. AI/Vision ishlamadi. Captiondan film nomi topilmadi.", show_alert=True)
 
 
@@ -1151,7 +1200,7 @@ async def ai_write_main_post(call: types.CallbackQuery):
         return
 
     if call.message.photo:
-        _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id, poster_caption=caption)
+        _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id, poster_caption=caption, ai_phase="awaiting_trailer")
 
     session = ai_channel_session.get(int(call.message.chat.id), {})
     confidence = str(session.get("confidence", "high")).lower() if isinstance(session, dict) else "high"
@@ -1172,14 +1221,11 @@ async def ai_write_trailer_post(call: types.CallbackQuery):
         await call.answer("❌ Topilmadi", show_alert=True)
         return
 
-    metadata = _current_ai_metadata(call.message.chat.id)
+    metadata, metadata_error = await _resolve_ai_metadata_for_message(call.message)
     if not metadata:
-        title = parse_title_from_manual_caption(call.message.caption or "")
-        if title:
-            metadata = manual_session_cache(call.message.chat.id, call.message.message_id, call.message.caption or "")
-        else:
-            await call.answer('❌ Cached title topilmadi. Avval poster ostidagi "🎬 Film postini yozish" tugmasini bosing. Vision qayta chaqirilmadi.', show_alert=True)
-            return
+        await _notify_admin(f"⚠️ AI treyler metadata topilmadi. Xato: {metadata_error}")
+        await call.answer(f"❌ {metadata_error}", show_alert=True)
+        return
 
     try:
         await bot.edit_message_caption(
@@ -1196,7 +1242,7 @@ async def ai_write_trailer_post(call: types.CallbackQuery):
         await call.answer("❌ Treyler captionini kanal postiga qo‘shib bo‘lmadi. Bot kanal postini tahrirlash huquqini tekshiring.", show_alert=True)
         return
 
-    _ai_update_session(call.message.chat.id, trailer={"from_chat_id": call.message.chat.id, "message_id": call.message.message_id}, trailer_caption=_ai_trailer_post(metadata))
+    _ai_update_session(call.message.chat.id, trailer={"from_chat_id": call.message.chat.id, "message_id": call.message.message_id}, trailer_caption=_ai_trailer_post(metadata), ai_phase="awaiting_video")
     await call.answer("✅ Treyler captioni kanal postiga qo‘yildi")
 
 
@@ -1209,14 +1255,11 @@ async def ai_name_video(call: types.CallbackQuery):
         await call.answer("❌ Topilmadi", show_alert=True)
         return
 
-    metadata = _current_ai_metadata(call.message.chat.id)
+    metadata, metadata_error = await _resolve_ai_metadata_for_message(call.message)
     if not metadata:
-        title = parse_title_from_manual_caption(call.message.caption or "")
-        if title:
-            metadata = manual_session_cache(call.message.chat.id, call.message.message_id, call.message.caption or "")
-        else:
-            await call.answer('❌ Cached title topilmadi. Avval poster ostidagi "🎬 Film postini yozish" tugmasini bosing. Vision qayta chaqirilmadi.', show_alert=True)
-            return
+        await _notify_admin(f"⚠️ AI nomlash metadata topilmadi. Xato: {metadata_error}")
+        await call.answer(f"❌ {metadata_error}", show_alert=True)
+        return
 
     content_type = _ai_content_type(call.message.chat.id)
     if not content_type:
@@ -1239,6 +1282,7 @@ async def ai_name_video(call: types.CallbackQuery):
         await call.answer("❌ Videoni avtomatik nomlab bo‘lmadi. Captionni qo‘lda tahrirlashingiz mumkin.", show_alert=True)
         return
 
+    _ai_update_session(call.message.chat.id, ai_phase="naming_done")
     if content_type == "series":
         await call.answer("✅ Qism captioni kanal postiga qo‘yildi")
         return
