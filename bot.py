@@ -214,7 +214,7 @@ def admin_menu():
     kb.row("🎬 Qidiruv", "📊 Statistika")
     kb.row("📦 Kino backup")  # 🆕 stat backup olib tashlandi
     kb.row("♻️ Kino restore")  # 🆕 stat restore olib tashlandi
-    kb.row("📣 Kanalga yuborish", "⏰ Avtopost")
+    kb.row("⚙️ Sozlash", "⏰ Avtopost")
     kb.row("❌ Bekor qilish")
     return kb
 
@@ -493,9 +493,23 @@ def normalize_country(value: Any) -> str:
         text = clean_text_output(value)
         parts = [p for p in re.split(r"\s*,\s*", text) if p.strip()]
 
-    cleaned = [clean_text_output(part) for part in parts]
+    country_map = {
+        "usa": "AQSH", "us": "AQSH", "u.s.a": "AQSH", "united states": "AQSH", "america": "AQSH",
+        "uk": "Buyuk Britaniya", "united kingdom": "Buyuk Britaniya", "great britain": "Buyuk Britaniya",
+        "russia": "Rossiya", "south korea": "Janubiy Koreya", "korea": "Janubiy Koreya",
+        "japan": "Yaponiya", "china": "Xitoy", "india": "Hindiston", "turkey": "Turkiya",
+    }
+    cleaned = []
+    for part in parts:
+        name = clean_text_output(part)
+        key = re.sub(r"[^a-z\s.]", "", name.lower()).strip()
+        cleaned.append(country_map.get(key, name))
     cleaned = [part for part in cleaned if part]
-    return ", ".join(cleaned) or AI_DEFAULT_METADATA["countries"]
+    unique: List[str] = []
+    for part in cleaned:
+        if part not in unique:
+            unique.append(part)
+    return ", ".join(unique) or AI_DEFAULT_METADATA["countries"]
 
 
 def normalize_cast(value: Any) -> str:
@@ -586,13 +600,33 @@ def parse_title_from_manual_caption(caption: str) -> str:
 
 def normalize_detected_title(title: str) -> str:
     text = clean_text_output(title)
+    text = re.sub(r"\[[^\]]+\]", " ", text)
+    text = re.sub(r"\{[^}]+\}", " ", text)
     text = re.sub(r"\b(official|poster|trailer|treyler|teaser|uzbek|o'zbek|uzbekcha|tarjima|dublyaj|kino|film|full|hd|4k|1080p|720p)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(uzmovi|uzmovie|asilmedia|tas-ix|premyera|premiere|yangi)\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bchapter\s+([ivxlcdm]+|\d+)\b", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\bpart\s+([ivxlcdm]+|\d+)\b", r"\1", text, flags=re.IGNORECASE)
     text = re.sub(r"\((19|20)\d{2}\)", " ", text)
+    text = re.sub(r"\([^)]*(?:mavsum|season|qism|episode|seriya|trailer|treyler)[^)]*\)", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(19|20)\d{2}\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" -:|/")
     return text or AI_DEFAULT_METADATA["title"]
+
+
+def _safe_json_object(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not m:
+            return {}
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def metadata_lookup_by_title(title: str) -> Dict[str, str]:
@@ -668,6 +702,10 @@ def _ai_update_session(chat_id: int, **kwargs: Any) -> Dict[str, Any]:
     return session
 
 
+def _ai_reset_session_for_new_poster(chat_id: int, message_id: int) -> None:
+    ai_channel_session[int(chat_id)] = {"poster_message_id": int(message_id), "ts": time.time(), "episodes": {}}
+
+
 def _publish_confirm_kb(kind: str, code: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     if kind == "series":
@@ -692,88 +730,15 @@ async def _send_ai_publish_prompt(kind: str, code: str) -> None:
 
 
 def ai_finalize_movie_session(message: types.Message, metadata: Dict[str, str]) -> Tuple[bool, str, Optional[str]]:
-    if not message.video:
-        return False, "❌ Film videosi topilmadi", None
-
-    db = load_db()
-    if _duplicate_video_exists(db, message.video.file_unique_id):
-        return False, "❗ Bu kino borku", None
-
-    session = _ai_session(message.chat.id)
-    if session.get("content_type") != "movie":
-        return False, "❌ Session film rejimida emas", None
-    if session.get("movie_code"):
-        return False, "⚠️ Bu film allaqachon draft qilingan", str(session.get("movie_code"))
-    poster_file_id = session.get("poster_file_id")
-    if not poster_file_id:
-        return False, "❌ Poster session topilmadi. Avval posterga caption tayyorlang.", None
-
-    code = generate_unique_code(db)
-    trailer = session.get("trailer") if isinstance(session.get("trailer"), dict) else None
-    post_caption = session.get("poster_caption") or _ai_main_post(metadata)
-
-    db[code] = {
-        "type": "movie",
-        "post_file_id": poster_file_id,
-        "post_caption": post_caption,
-        "video_file_id": message.video.file_id,
-        "video_unique_id": message.video.file_unique_id,
-        "channel_msg_id": None,
-        "trailer": trailer
-    }
-    save_db(db)
-    _ai_update_session(message.chat.id, movie_code=code, movie_video_file_id=message.video.file_id)
-    return True, "✅ Film draft bot bazasiga saqlandi", code
+    return False, "❌ AI save/finalize o‘chirilgan", None
 
 
 def _ai_store_series_episode(message: types.Message) -> Tuple[bool, str]:
-    if not message.video:
-        return False, "❌ Qism videosi topilmadi"
-    ep_num, ep_title = _parse_episode_caption(message.caption or "")
-    if ep_num is None:
-        return False, "❗ Video captionida qism raqami yo‘q."
-
-    session = _ai_session(message.chat.id)
-    episodes = session.get("episodes") if isinstance(session.get("episodes"), dict) else {}
-    episodes[str(ep_num)] = {
-        "video_file_id": message.video.file_id,
-        "video_unique_id": message.video.file_unique_id,
-        "title": (ep_title or "").strip()
-    }
-    _ai_update_session(message.chat.id, episodes=episodes)
-    return True, f"✅ Qabul qilindi: <b>{ep_num}-qisim</b>"
+    return False, "❌ AI save/finalize o‘chirilgan"
 
 
 def ai_finalize_series_session(chat_id: int) -> Tuple[bool, str, Optional[str]]:
-    session = _ai_session(chat_id)
-    if session.get("content_type") != "series":
-        return False, "❌ Session serial rejimida emas", None
-    if session.get("series_code"):
-        return False, "⚠️ Bu serial allaqachon draft qilingan", str(session.get("series_code"))
-    poster_file_id = session.get("poster_file_id")
-    if not poster_file_id:
-        return False, "❌ Poster session topilmadi. Avval serial posteriga caption tayyorlang.", None
-
-    episodes = session.get("episodes") if isinstance(session.get("episodes"), dict) else {}
-    if not episodes:
-        return False, "❗ Hech bo‘lmasa bitta qism qo‘shing.", None
-
-    db = load_db()
-    code = generate_unique_code(db)
-    trailer = session.get("trailer") if isinstance(session.get("trailer"), dict) else None
-    poster_caption = session.get("poster_caption") or _ai_main_post(session.get("metadata", {}))
-
-    db[code] = {
-        "type": "series",
-        "poster_file_id": poster_file_id,
-        "poster_caption": poster_caption,
-        "episodes": episodes,
-        "channel_msg_id": None,
-        "trailer": trailer
-    }
-    save_db(db)
-    _ai_update_session(chat_id, series_code=code)
-    return True, "✅ Serial draft bot bazasiga saqlandi", code
+    return False, "❌ AI save/finalize o‘chirilgan", None
 
 
 def _ai_main_post(meta: Dict[str, str]) -> str:
@@ -814,6 +779,8 @@ def _current_ai_metadata(chat_id: int) -> Optional[Dict[str, str]]:
 def _save_ai_metadata(chat_id: int, message_id: int, metadata: Dict[str, str], source: str = "ai", confidence: Optional[str] = None) -> None:
     meta = _normalize_ai_metadata(metadata)
     confidence = confidence or verify_metadata_confidence(meta)
+    old_session = ai_channel_session.get(int(chat_id))
+    preserved = dict(old_session) if isinstance(old_session, dict) else {}
     session_data = {
         "source": source,
         "title": meta.get("title", ""),
@@ -828,7 +795,8 @@ def _save_ai_metadata(chat_id: int, message_id: int, metadata: Dict[str, str], s
         "timestamp": time.time(),
     }
     ai_poster_cache[int(message_id)] = meta
-    ai_channel_session[int(chat_id)] = {"metadata": meta, "poster_message_id": int(message_id), "ts": time.time(), "source": source, "confidence": confidence, "session_data": session_data}
+    preserved.update({"metadata": meta, "poster_message_id": int(message_id), "ts": time.time(), "source": source, "confidence": confidence, "session_data": session_data})
+    ai_channel_session[int(chat_id)] = preserved
     _cleanup_ai_sessions()
 
 
@@ -858,8 +826,9 @@ async def _openai_poster_metadata(image_data_url: str) -> Tuple[Optional[Dict[st
     prompt = (
         "Poster rasmdagi film/serialni aniqlang. Faqat JSON qaytaring. "
         "Kalitlar: title, countries, year, rating, genres, director, cast, description. "
-        "title o'zbek lotin yozuvida bo'lsin; kerak bo'lsa nomni o'zbekcha transliteratsiya yoki tarjima qiling. "
-        "genres hashtag ko'rinishida bo'lsin. description 3-4 qatorlik o'zbekcha, spoilersiz bo'lsin. "
+        "title faqat asosiy nom bo'lsin: subtitr, sifat, treyler, yil, qism, mavsum, reklama so'zlarini olib tashlang. "
+        "countries davlat nomlari normal yozilsin. genres hashtag ko'rinishida bo'lsin. "
+        "cast faqat aktyorlar ismlari bo'lsin. description 3-4 qatorlik o'zbekcha, spoilersiz bo'lsin. "
         "Aniq bo'lmagan maydonlarga Noma'lum yozing."
     )
     payload = {
@@ -902,7 +871,10 @@ async def _openai_poster_metadata(image_data_url: str) -> Tuple[Optional[Dict[st
             text = "".join(chunks)
         if not text:
             return None, "OpenAI javob berdi, lekin matn/metadata qaytmadi."
-        return _normalize_ai_metadata(json.loads(text)), None
+        parsed = _safe_json_object(text)
+        if not parsed:
+            return None, "OpenAI JSON javobini xavfsiz tahlil qilib bo‘lmadi."
+        return _normalize_ai_metadata(parsed), None
     except asyncio.TimeoutError:
         return None, "OpenAI Vision javobi kechikdi (timeout). Manual workflow saqlanadi."
     except Exception as e:
@@ -973,7 +945,14 @@ def ai_poster_kb(message_id: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("🎬 Film", callback_data=f"ai:type:movie:{message_id}"),
-        types.InlineKeyboardButton("📺 Serial", callback_data=f"ai:type:series:{message_id}"),
+        types.InlineKeyboardButton("📺 Serial", callback_data=f"ai:type:series:{message_id}")
+    )
+    return kb
+
+
+def ai_poster_action_kb(message_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
         types.InlineKeyboardButton("🎬 Film postini yozish", callback_data=f"ai:poster:{message_id}"),
         types.InlineKeyboardButton("✍️ Qo‘lda yozaman", callback_data=f"ai:manual:poster:{message_id}")
     )
@@ -1052,6 +1031,7 @@ def save_autopost(data: Dict[str, Any]) -> None:
 async def base_channel_photo_ai(message: types.Message):
     if int(message.chat.id) != int(CHANNEL1_ID):
         return
+    _ai_reset_session_for_new_poster(message.chat.id, message.message_id)
     try:
         await bot.edit_message_reply_markup(
             chat_id=message.chat.id,
@@ -1096,7 +1076,8 @@ async def ai_choose_content_type(call: types.CallbackQuery):
     _ai_update_session(call.message.chat.id, content_type=content_type)
 
     if call.message.photo:
-        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_poster_kb(call.message.message_id))
+        _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id)
+        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_poster_action_kb(call.message.message_id))
     elif call.message.video:
         await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_video_kb(call.message))
 
@@ -1240,28 +1221,11 @@ async def ai_name_video(call: types.CallbackQuery):
         await call.answer("❌ Videoni avtomatik nomlab bo‘lmadi. Captionni qo‘lda tahrirlashingiz mumkin.", show_alert=True)
         return
 
-    ep_num, _ = _parse_episode_caption(call.message.caption or "")
     if content_type == "series":
-        ok, msg = _ai_store_series_episode(call.message)
-        if not ok:
-            await call.answer(msg, show_alert=True)
-            return
-        kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("📦 Serial tugadi", callback_data=f"ai:series_done:{call.message.chat.id}"))
-        await bot.send_message(ADMIN_ID, f"{msg}\n📦 Serial tugadimi?", reply_markup=kb, parse_mode="HTML")
         await call.answer("✅ Qism captioni kanal postiga qo‘yildi")
         return
 
-    if content_type != "movie":
-        await call.answer("❌ Serial rejimida film finalize ishlamaydi. Qism qo‘shing yoki 📦 Serial tugadi tugmasini bosing.", show_alert=True)
-        return
-
-    ok, msg, code = ai_finalize_movie_session(call.message, metadata)
-    if not ok or not code:
-        await call.answer(msg, show_alert=True)
-        return
-    await _send_ai_publish_prompt("movie", code)
-    await call.answer("✅ Film draft bot bazasiga saqlandi")
+    await call.answer("✅ Film captioni kanal postiga qo‘yildi")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("ai:series_done:"))
@@ -1269,28 +1233,7 @@ async def ai_series_done(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer("❌ Brat, bu joy adminniki 😄", show_alert=True)
         return
-
-    try:
-        chat_id = int(call.data.split(":", 2)[2])
-    except Exception:
-        await call.answer("❌ Topilmadi", show_alert=True)
-        return
-
-    if _ai_content_type(chat_id) != "series":
-        await call.answer("❌ Bu session serial rejimida emas", show_alert=True)
-        return
-
-    ok, msg, code = ai_finalize_series_session(chat_id)
-    if not ok or not code:
-        await call.answer(msg, show_alert=True)
-        return
-
-    try:
-        await call.message.edit_text(msg)
-    except Exception:
-        pass
-    await _send_ai_publish_prompt("series", code)
-    await call.answer("✅ Serial draft bot bazasiga saqlandi")
+    await call.answer("❌ AI save/finalize o‘chirilgan. Bazaga saqlash uchun eski admin workflowdan foydalaning.", show_alert=True)
 
 
 def _ap_new_id(jobs: List[Dict[str, Any]]) -> str:
@@ -1326,6 +1269,20 @@ def autopost_edit_kb():
         types.InlineKeyboardButton("❌ Bekor qilish", callback_data="ap_edit_cancel"),
     )
     return kb
+
+
+def settings_menu_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📣 Kanalga yuborish")
+    kb.row("📭 Kanalga yuborilmaganlar")
+    kb.row("❌ Bekor qilish")
+    return kb
+
+
+def _content_display_title(item: Dict[str, Any]) -> str:
+    caption = item.get("post_caption") if item.get("type") == "movie" else item.get("poster_caption")
+    title = parse_title_from_manual_caption(caption or "")
+    return title or "Noma'lum"
 
 # ================== PUBLISH HELPERS ==================
 async def publish_to_channel(code: str) -> Tuple[bool, str]:
@@ -2740,6 +2697,46 @@ async def recheck(call: types.CallbackQuery):
         await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz 😕", show_alert=True)
 
 # ================== KANALGA YUBORILMAGANLAR ==================
+@dp.message_handler(lambda m: m.text == "⚙️ Sozlash")
+async def settings_btn(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "❌ <b>Brat siz admin emassiz!</b>\n🎬 Faqat <b>Qidiruv</b> tugmasidan foydalanishingiz mumkin.",
+            reply_markup=user_menu()
+        )
+        return
+
+    await state.finish()
+    await message.answer("⚙️ Sozlash", reply_markup=settings_menu_kb())
+
+
+@dp.message_handler(lambda m: m.text == "📭 Kanalga yuborilmaganlar")
+async def unpublished_list_btn(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "❌ <b>Brat siz admin emassiz!</b>\n🎬 Faqat <b>Qidiruv</b> tugmasidan foydalanishingiz mumkin.",
+            reply_markup=user_menu()
+        )
+        return
+
+    await state.finish()
+    db = load_db()
+    rows = []
+    for code, item in db.items():
+        if not isinstance(item, dict) or item.get("channel_msg_id"):
+            continue
+        rows.append((_content_display_title(item), str(code)))
+
+    if not rows:
+        await message.answer("📭 Kanalga yuborilmagan kino yo‘q", reply_markup=settings_menu_kb())
+        return
+
+    lines = ["📭 Kanalga yuborilmaganlar\n"]
+    for title, code in rows[:80]:
+        lines.append(f"{title} | {code}")
+    await message.answer("\n".join(lines), reply_markup=settings_menu_kb())
+
+
 @dp.message_handler(lambda m: m.text == "📣 Kanalga yuborish")
 async def publish_later_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2750,7 +2747,7 @@ async def publish_later_btn(message: types.Message, state: FSMContext):
         return
 
     await state.finish()
-    await message.answer("🆔 Kodni yuboring (kanalga chiqmagan bo'lsa jo'natamiz)", reply_markup=admin_menu())
+    await message.answer("🆔 Kodni yuboring (kanalga chiqmagan bo'lsa jo'natamiz)", reply_markup=settings_menu_kb())
     await PublishLater.code.set()
 
 
@@ -2762,20 +2759,20 @@ async def publish_later_code(message: types.Message, state: FSMContext):
 
     code = (message.text or "").strip()
     if not code.isdigit():
-        await message.answer("🆔 Kodni yuboring", reply_markup=admin_menu())
+        await message.answer("🆔 Kodni yuboring", reply_markup=settings_menu_kb())
         return
 
     db = load_db()
     item = db.get(code)
 
     if not item:
-        await message.answer("❌ Bunaqa kino o'zi yo'q", reply_markup=admin_menu())
+        await message.answer("❌ Bunaqa kino o'zi yo'q", reply_markup=settings_menu_kb())
         await state.finish()
         return
 
     # ================== DUBLIKAT TEKSHIRUV ==================
     if item.get("channel_msg_id"):
-        await message.answer("⚠️ Bu kino 2K kanalda bor. Dublikat yubormaymiz.", reply_markup=admin_menu())
+        await message.answer("⚠️ Bu kino 2K kanalda bor. Dublikat yubormaymiz.", reply_markup=settings_menu_kb())
         await state.finish()
         return
 
@@ -2837,8 +2834,14 @@ async def ap_menu_router(message: types.Message, state: FSMContext):
         # sort by time
         pending_sorted = sorted(pending, key=lambda j: j.get("run_at", ""))
         lines = ["📋 Rejalashtirilgan kinolar\n"]
+        db = load_db()
         for j in pending_sorted[:40]:
-            lines.append(f"{j.get('id')} — 🎬 {j.get('code')} — ⏰ {j.get('run_at')}")
+            code = str(j.get("code", "")).strip()
+            item = db.get(code, {}) if isinstance(db, dict) else {}
+            title = _content_display_title(item) if isinstance(item, dict) else "Noma'lum"
+            run_at_dt = _parse_dt_local(str(j.get("run_at", "")))
+            run_at_text = run_at_dt.strftime("%H:%M") if run_at_dt else str(j.get("run_at", ""))
+            lines.append(f"{j.get('id')} — {title} | {code} | {run_at_text}")
         await message.answer("\n".join(lines), reply_markup=autopost_menu_kb())
         return
 
