@@ -668,6 +668,20 @@ def _ai_update_session(chat_id: int, **kwargs: Any) -> Dict[str, Any]:
     return session
 
 
+def _ai_reset_session_for_new_poster(chat_id: int, message_id: int, poster_file_id: Optional[str] = None, poster_caption: str = "") -> Dict[str, Any]:
+    """Start a fresh AI upload session when a new poster arrives in the base channel."""
+    session: Dict[str, Any] = {
+        "metadata": dict(AI_DEFAULT_METADATA),
+        "poster_message_id": int(message_id),
+        "poster_file_id": poster_file_id,
+        "poster_caption": poster_caption or "",
+        "ts": time.time(),
+        "episodes": {},
+    }
+    ai_channel_session[int(chat_id)] = session
+    return session
+
+
 def _publish_confirm_kb(kind: str, code: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     if kind == "series":
@@ -683,12 +697,22 @@ def _publish_confirm_kb(kind: str, code: str) -> types.InlineKeyboardMarkup:
     return kb
 
 
-async def _send_ai_publish_prompt(kind: str, code: str) -> None:
+async def _send_ai_publish_prompt(kind: str, code: str, title: str = "") -> None:
+    display_title = clean_text_output(title) or ("Serial" if kind == "series" else "Film")
     if kind == "series":
-        text = f"📺 Serial tayyorlandi.\n🆔 Kod: {code}\n📤 Kanalga yuborasizmi?"
+        text = f"🎬{display_title}\n🆔 Kod: {code}\n📤 Kanalga yuborilsinmi?"
     else:
-        text = f"🎬 Film tayyorlandi.\n🆔 Kod: {code}\n📤 Kanalga yuborasizmi?"
+        text = f"🎬{display_title}\n🆔 Kod: {code}\n📤 Kanalga yuborilsinmi?"
     await bot.send_message(ADMIN_ID, text, reply_markup=_publish_confirm_kb(kind, code))
+
+
+def _ai_save_confirm_kb(kind: str, chat_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ Saqlash", callback_data=f"ai:save:{kind}:{chat_id}"),
+        types.InlineKeyboardButton("❌ Bekor qilish", callback_data=f"ai:cancel_save:{kind}:{chat_id}")
+    )
+    return kb
 
 
 def ai_finalize_movie_session(message: types.Message, metadata: Dict[str, str]) -> Tuple[bool, str, Optional[str]]:
@@ -703,16 +727,14 @@ def ai_finalize_movie_session(message: types.Message, metadata: Dict[str, str]) 
     if session.get("content_type") != "movie":
         return False, "❌ Session film rejimida emas", None
     if session.get("movie_code"):
-        return False, "⚠️ Bu film allaqachon draft qilingan", str(session.get("movie_code"))
+        return False, "⚠️ Bu film allaqachon bazaga saqlangan", str(session.get("movie_code"))
     poster_file_id = session.get("poster_file_id")
     if not poster_file_id:
         return False, "❌ Poster session topilmadi. Avval posterga caption tayyorlang.", None
 
-    code = generate_unique_code(db)
     trailer = session.get("trailer") if isinstance(session.get("trailer"), dict) else None
     post_caption = session.get("poster_caption") or _ai_main_post(metadata)
-
-    db[code] = {
+    pending_movie = {
         "type": "movie",
         "post_file_id": poster_file_id,
         "post_caption": post_caption,
@@ -721,9 +743,13 @@ def ai_finalize_movie_session(message: types.Message, metadata: Dict[str, str]) 
         "channel_msg_id": None,
         "trailer": trailer
     }
-    save_db(db)
-    _ai_update_session(message.chat.id, movie_code=code, movie_video_file_id=message.video.file_id)
-    return True, "✅ Film draft bot bazasiga saqlandi", code
+    _ai_update_session(
+        message.chat.id,
+        pending_movie=pending_movie,
+        pending_movie_title=_normalize_ai_metadata(metadata).get("title", ""),
+        movie_video_file_id=message.video.file_id
+    )
+    return True, "🎬 Bazaga yangi film qo‘shildi.\n💾 Saqlansinmi?", None
 
 
 def _ai_store_series_episode(message: types.Message) -> Tuple[bool, str]:
@@ -749,7 +775,7 @@ def ai_finalize_series_session(chat_id: int) -> Tuple[bool, str, Optional[str]]:
     if session.get("content_type") != "series":
         return False, "❌ Session serial rejimida emas", None
     if session.get("series_code"):
-        return False, "⚠️ Bu serial allaqachon draft qilingan", str(session.get("series_code"))
+        return False, "⚠️ Bu serial allaqachon bazaga saqlangan", str(session.get("series_code"))
     poster_file_id = session.get("poster_file_id")
     if not poster_file_id:
         return False, "❌ Poster session topilmadi. Avval serial posteriga caption tayyorlang.", None
@@ -758,12 +784,10 @@ def ai_finalize_series_session(chat_id: int) -> Tuple[bool, str, Optional[str]]:
     if not episodes:
         return False, "❗ Hech bo‘lmasa bitta qism qo‘shing.", None
 
-    db = load_db()
-    code = generate_unique_code(db)
     trailer = session.get("trailer") if isinstance(session.get("trailer"), dict) else None
-    poster_caption = session.get("poster_caption") or _ai_main_post(session.get("metadata", {}))
-
-    db[code] = {
+    metadata = session.get("metadata", {}) if isinstance(session.get("metadata"), dict) else {}
+    poster_caption = session.get("poster_caption") or _ai_main_post(metadata)
+    pending_series = {
         "type": "series",
         "poster_file_id": poster_file_id,
         "poster_caption": poster_caption,
@@ -771,9 +795,12 @@ def ai_finalize_series_session(chat_id: int) -> Tuple[bool, str, Optional[str]]:
         "channel_msg_id": None,
         "trailer": trailer
     }
-    save_db(db)
-    _ai_update_session(chat_id, series_code=code)
-    return True, "✅ Serial draft bot bazasiga saqlandi", code
+    _ai_update_session(
+        chat_id,
+        pending_series=pending_series,
+        pending_series_title=_normalize_ai_metadata(metadata).get("title", "")
+    )
+    return True, "📺 Bazaga yangi serial qo‘shildi.\n💾 Saqlansinmi?", None
 
 
 def _ai_main_post(meta: Dict[str, str]) -> str:
@@ -828,7 +855,15 @@ def _save_ai_metadata(chat_id: int, message_id: int, metadata: Dict[str, str], s
         "timestamp": time.time(),
     }
     ai_poster_cache[int(message_id)] = meta
-    ai_channel_session[int(chat_id)] = {"metadata": meta, "poster_message_id": int(message_id), "ts": time.time(), "source": source, "confidence": confidence, "session_data": session_data}
+    session = _ai_session(chat_id)
+    session.update({
+        "metadata": meta,
+        "poster_message_id": int(message_id),
+        "ts": time.time(),
+        "source": source,
+        "confidence": confidence,
+        "session_data": session_data,
+    })
     _cleanup_ai_sessions()
 
 
@@ -970,10 +1005,12 @@ def _ai_content_type(chat_id: int) -> Optional[str]:
 
 
 def ai_poster_kb(message_id: int) -> types.InlineKeyboardMarkup:
+    return ai_content_type_kb(message_id)
+
+
+def ai_poster_actions_kb(message_id: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("🎬 Film", callback_data=f"ai:type:movie:{message_id}"),
-        types.InlineKeyboardButton("📺 Serial", callback_data=f"ai:type:series:{message_id}"),
         types.InlineKeyboardButton("🎬 Film postini yozish", callback_data=f"ai:poster:{message_id}"),
         types.InlineKeyboardButton("✍️ Qo‘lda yozaman", callback_data=f"ai:manual:poster:{message_id}")
     )
@@ -1000,24 +1037,18 @@ def ai_name_kb(message_id: int) -> types.InlineKeyboardMarkup:
 
 def ai_video_kb(message: types.Message) -> types.InlineKeyboardMarkup:
     caption = (message.caption or "").lower()
-    if "treyler" in caption or "trailer" in caption:
-        return ai_trailer_kb(message.message_id)
-
     ctype = _ai_content_type(message.chat.id)
+    if "treyler" in caption or "trailer" in caption:
+        if ctype:
+            return ai_trailer_kb(message.message_id)
+        return ai_content_type_kb(message.message_id)
+
     if ctype == "movie":
         return ai_name_kb(message.message_id)
     if ctype == "series":
         return ai_name_kb(message.message_id)
 
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🎬 Film", callback_data=f"ai:type:movie:{message.message_id}"),
-        types.InlineKeyboardButton("📺 Serial", callback_data=f"ai:type:series:{message.message_id}"),
-        types.InlineKeyboardButton("🎞 Treyler uchun post", callback_data=f"ai:trailer:{message.message_id}"),
-        types.InlineKeyboardButton("📁 Nomlash", callback_data=f"ai:name:{message.message_id}"),
-        types.InlineKeyboardButton("✍️ Qo‘lda yozaman", callback_data=f"ai:manual:video:{message.message_id}")
-    )
-    return kb
+    return ai_content_type_kb(message.message_id)
 
 # ================== AUTPOST STORAGE ==================
 def load_autopost() -> Dict[str, Any]:
@@ -1052,6 +1083,12 @@ def save_autopost(data: Dict[str, Any]) -> None:
 async def base_channel_photo_ai(message: types.Message):
     if int(message.chat.id) != int(CHANNEL1_ID):
         return
+    _ai_reset_session_for_new_poster(
+        message.chat.id,
+        message.message_id,
+        poster_file_id=message.photo[-1].file_id if message.photo else None,
+        poster_caption=message.caption or ""
+    )
     try:
         await bot.edit_message_reply_markup(
             chat_id=message.chat.id,
@@ -1093,10 +1130,13 @@ async def ai_choose_content_type(call: types.CallbackQuery):
         return
 
     content_type = parts[2]
-    _ai_update_session(call.message.chat.id, content_type=content_type)
+    update_kwargs = {"content_type": content_type}
+    if call.message.photo:
+        update_kwargs.update(poster_file_id=call.message.photo[-1].file_id, poster_caption=call.message.caption or "")
+    _ai_update_session(call.message.chat.id, **update_kwargs)
 
     if call.message.photo:
-        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_poster_kb(call.message.message_id))
+        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_poster_actions_kb(call.message.message_id))
     elif call.message.video:
         await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=ai_video_kb(call.message))
 
@@ -1112,12 +1152,23 @@ async def ai_manual_mode(call: types.CallbackQuery):
         await call.answer("❌ Topilmadi", show_alert=True)
         return
 
+    mode = call.data.split(":")[2] if len(call.data.split(":")) > 2 else ""
+    if mode in ("poster", "trailer", "video", "name") and not _ai_content_type(call.message.chat.id):
+        await call.answer("❗ Avval content turini tanlang: 🎬 Film yoki 📺 Serial", show_alert=True)
+        return
+
     await _remove_inline_buttons(call.message)
     title = parse_title_from_manual_caption(call.message.caption or "")
     if title:
         metadata = manual_session_cache(call.message.chat.id, call.message.message_id, call.message.caption or "")
         if call.message.photo:
             _ai_update_session(call.message.chat.id, poster_file_id=call.message.photo[-1].file_id, poster_caption=call.message.caption or "")
+        elif mode == "trailer" and call.message.video:
+            _ai_update_session(
+                call.message.chat.id,
+                trailer={"from_chat_id": call.message.chat.id, "message_id": call.message.message_id},
+                trailer_caption=call.message.caption or ""
+            )
         await call.answer(f"✅ Manual title saqlandi: {metadata.get('title', title)}", show_alert=True)
     else:
         await call.answer("✅ Qo‘lda yozish rejimi tanlandi. AI/Vision ishlamadi. Captiondan film nomi topilmadi.", show_alert=True)
@@ -1173,6 +1224,10 @@ async def ai_write_trailer_post(call: types.CallbackQuery):
         return
     if not call.message or int(call.message.chat.id) != int(CHANNEL1_ID):
         await call.answer("❌ Topilmadi", show_alert=True)
+        return
+
+    if not _ai_content_type(call.message.chat.id):
+        await call.answer("❗ Avval content turini tanlang: 🎬 Film yoki 📺 Serial", show_alert=True)
         return
 
     metadata = _current_ai_metadata(call.message.chat.id)
@@ -1257,11 +1312,11 @@ async def ai_name_video(call: types.CallbackQuery):
         return
 
     ok, msg, code = ai_finalize_movie_session(call.message, metadata)
-    if not ok or not code:
+    if not ok:
         await call.answer(msg, show_alert=True)
         return
-    await _send_ai_publish_prompt("movie", code)
-    await call.answer("✅ Film draft bot bazasiga saqlandi")
+    await bot.send_message(ADMIN_ID, msg, reply_markup=_ai_save_confirm_kb("movie", call.message.chat.id))
+    await call.answer("✅ Film nomlandi. Saqlashni tasdiqlang")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("ai:series_done:"))
@@ -1281,16 +1336,98 @@ async def ai_series_done(call: types.CallbackQuery):
         return
 
     ok, msg, code = ai_finalize_series_session(chat_id)
-    if not ok or not code:
+    if not ok:
         await call.answer(msg, show_alert=True)
         return
 
     try:
-        await call.message.edit_text(msg)
+        await call.message.edit_text(msg, reply_markup=_ai_save_confirm_kb("series", chat_id))
+    except Exception:
+        await bot.send_message(ADMIN_ID, msg, reply_markup=_ai_save_confirm_kb("series", chat_id))
+    await call.answer("✅ Serial tayyor. Saqlashni tasdiqlang")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("ai:save:"))
+async def ai_save_pending(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Brat, bu joy adminniki 😄", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 4 or parts[2] not in ("movie", "series"):
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+
+    kind = parts[2]
+    try:
+        chat_id = int(parts[3])
+    except Exception:
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+
+    session = _ai_session(chat_id)
+    pending_key = "pending_series" if kind == "series" else "pending_movie"
+    pending = session.get(pending_key)
+    if not isinstance(pending, dict):
+        await call.answer("❌ Saqlanadigan draft topilmadi", show_alert=True)
+        return
+
+    db = load_db()
+    if kind == "movie" and _duplicate_video_exists(db, pending.get("video_unique_id")):
+        await call.answer("❗ Bu kino borku", show_alert=True)
+        return
+
+    code = generate_unique_code(db)
+    db[code] = pending
+    save_db(db)
+
+    title_key = "pending_series_title" if kind == "series" else "pending_movie_title"
+    title = clean_text_output(str(session.get(title_key, "")))
+    if not title:
+        caption_key = "poster_caption" if kind == "series" else "post_caption"
+        title = parse_title_from_manual_caption(str(pending.get(caption_key, "")))
+
+    if kind == "series":
+        _ai_update_session(chat_id, series_code=code, pending_series=None)
+    else:
+        _ai_update_session(chat_id, movie_code=code, pending_movie=None)
+
+    try:
+        await call.message.edit_text("✅ Saqlandi")
     except Exception:
         pass
-    await _send_ai_publish_prompt("series", code)
-    await call.answer("✅ Serial draft bot bazasiga saqlandi")
+    await _send_ai_publish_prompt(kind, code, title)
+    await call.answer("✅ Bazaga saqlandi")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("ai:cancel_save:"))
+async def ai_cancel_pending_save(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Brat, bu joy adminniki 😄", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    if len(parts) != 4 or parts[2] not in ("movie", "series"):
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+
+    kind = parts[2]
+    try:
+        chat_id = int(parts[3])
+    except Exception:
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+
+    if kind == "series":
+        _ai_update_session(chat_id, pending_series=None, pending_series_title=None)
+    else:
+        _ai_update_session(chat_id, pending_movie=None, pending_movie_title=None)
+
+    try:
+        await call.message.edit_text("❎ Saqlash bekor qilindi.")
+    except Exception:
+        pass
+    await call.answer("❎ Bekor qilindi")
 
 
 def _ap_new_id(jobs: List[Dict[str, Any]]) -> str:
