@@ -209,11 +209,9 @@ def user_menu():
 
 def admin_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("➕ Kino qo‘shish", "➕ Serial qo‘shish")
-    kb.row("✏️ Tahrirlash", "🗑 O‘chirish")
+    kb.row("➕ Kino qo‘shish")
+    kb.row("➕ Serial qo‘shish")
     kb.row("🎬 Qidiruv", "📊 Statistika")
-    kb.row("📦 Kino backup")  # 🆕 stat backup olib tashlandi
-    kb.row("♻️ Kino restore")  # 🆕 stat restore olib tashlandi
     kb.row("⚙️ Sozlash", "⏰ Avtopost")
     kb.row("❌ Bekor qilish")
     return kb
@@ -491,25 +489,30 @@ def normalize_country(value: Any) -> str:
     parts = _safe_literal_list(value)
     if parts is None:
         text = clean_text_output(value)
-        parts = [p for p in re.split(r"\s*,\s*", text) if p.strip()]
+        parts = [p for p in re.split(r"\s*,\s*|\s*\+\s*|\s*/\s*|\s+and\s+|\s+va\s+", text, flags=re.IGNORECASE) if p.strip()]
 
     country_map = {
         "usa": "AQSH", "us": "AQSH", "u.s.a": "AQSH", "united states": "AQSH", "america": "AQSH",
         "uk": "Buyuk Britaniya", "united kingdom": "Buyuk Britaniya", "great britain": "Buyuk Britaniya",
         "russia": "Rossiya", "south korea": "Janubiy Koreya", "korea": "Janubiy Koreya",
         "japan": "Yaponiya", "china": "Xitoy", "india": "Hindiston", "turkey": "Turkiya",
+        "mexico": "Meksika", "canada": "Kanada", "france": "Fransiya", "germany": "Germaniya",
+        "spain": "Ispaniya", "italy": "Italiya", "australia": "Avstraliya", "brazil": "Braziliya",
+        "uzbekistan": "O‘zbekiston", "uzbekiston": "O‘zbekiston",
     }
     cleaned = []
     for part in parts:
         name = clean_text_output(part)
         key = re.sub(r"[^a-z\s.]", "", name.lower()).strip()
+        if key in {"unknown", "nomalum", "noma lum", "n/a", "none", "null"}:
+            continue
         cleaned.append(country_map.get(key, name))
-    cleaned = [part for part in cleaned if part]
+    cleaned = [part for part in cleaned if part and part != AI_DEFAULT_METADATA["countries"]]
     unique: List[str] = []
     for part in cleaned:
         if part not in unique:
             unique.append(part)
-    return ", ".join(unique) or AI_DEFAULT_METADATA["countries"]
+    return ", ".join(unique[:3]) or AI_DEFAULT_METADATA["countries"]
 
 
 def _normalize_people(value: Any, default: str) -> str:
@@ -524,7 +527,8 @@ def _normalize_people(value: Any, default: str) -> str:
         name = noise.sub(" ", clean_text_output(part))
         name = re.sub(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҒғҚқҲҳЎўʻ‘’'\.\-\s]", " ", name)
         name = re.sub(r"\s+", " ", name).strip(" -,.:")
-        if name and name.lower() not in {"n/a", "none", "null"} and name not in cleaned:
+        name_key = re.sub(r"[^a-zа-яёіїєғқҳў0-9]", "", name.lower())
+        if name and name_key not in {"n/a", "none", "null", "nomalum", "unknown"} and name not in cleaned:
             cleaned.append(name)
     return ", ".join(cleaned[:8]) or default
 
@@ -537,20 +541,65 @@ def normalize_director(value: Any) -> str:
     return _normalize_people(value, AI_DEFAULT_METADATA["director"])
 
 
+def normalize_year(value: Any, title_hint: str = "") -> str:
+    text = clean_text_output(value)
+    candidates = re.findall(r"\b(18\d{2}|19\d{2}|20\d{2})\b", f"{text} {clean_text_output(title_hint)}")
+    if not candidates:
+        return AI_DEFAULT_METADATA["year"]
+    current_year = datetime.now().year + 1
+    for year in candidates:
+        y = int(year)
+        if 1888 <= y <= current_year:
+            return year
+    return AI_DEFAULT_METADATA["year"]
+
+
+def normalize_description(value: Any, title: str = "") -> str:
+    text = clean_text_output(value)
+    generic_patterns = (
+        r"film haqida qisqa ma'?lumot", r"admin poster", r"syujet tafsilotlari",
+        r"hikoya ochib beradi", r"story follows", r"tells the story", r"this movie",
+    )
+    for pattern in generic_patterns:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 45:
+        return AI_DEFAULT_METADATA["description"]
+
+    sentences = [s.strip(" .") for s in re.split(r"(?<=[.!?])\s+", text) if s.strip(" .")]
+    if not sentences:
+        sentences = [text]
+    lines: List[str] = []
+    for sentence in sentences[:4]:
+        sentence = sentence.strip()
+        if sentence and sentence not in lines:
+            lines.append(sentence if sentence.endswith((".", "!", "?")) else f"{sentence}.")
+    return "\n".join(lines[:4]) or AI_DEFAULT_METADATA["description"]
+
+
 def normalize_genres(value: Any) -> str:
+    genre_map = {
+        "action": "jangari", "crime": "jinoyat", "thriller": "triller", "drama": "drama",
+        "sci-fi": "fantastika", "scifi": "fantastika", "science fiction": "fantastika",
+        "fantasy": "fantastika", "horror": "qorqinchli", "comedy": "komediya",
+        "romance": "romantika", "melodrama": "melodrama", "adventure": "sarguzasht",
+        "animation": "multfilm", "mystery": "detektiv", "detective": "detektiv",
+        "family": "oilaviy", "history": "tarixiy", "war": "urush", "biography": "biografiya",
+        "documentary": "hujjatli", "sport": "sport", "music": "musiqa",
+    }
     parts = _safe_literal_list(value)
     if parts is None:
-        text = clean_text_output(value)
+        text = clean_text_output(value).lower()
+        for src, dst in sorted(genre_map.items(), key=lambda x: len(x[0]), reverse=True):
+            text = re.sub(rf"\b{re.escape(src)}\b", dst, text, flags=re.IGNORECASE)
         text = text.replace("#_#", " ")
         text = text.replace("#", " #")
-        if "," in text:
-            parts = [p for p in text.split(",") if p.strip()]
-        else:
-            parts = [p for p in re.split(r"\s+", text) if p.strip()]
+        parts = [p for p in re.split(r"\s*,\s*|\s*/\s*|\s+va\s+|\s+and\s+|\s+", text, flags=re.IGNORECASE) if p.strip()]
 
     tags: List[str] = []
     for part in parts:
         tag = clean_text_output(part).lower()
+        tag = genre_map.get(tag, tag)
         tag = tag.replace("#", " ")
         tag = tag.replace("_", " ")
         tag = re.sub(r"[^0-9a-zа-яёіїєғқҳўʻ‘’'\s-]", " ", tag, flags=re.IGNORECASE)
@@ -559,8 +608,8 @@ def normalize_genres(value: Any) -> str:
         if not words:
             continue
         for word in words:
-            word = re.sub(r"^-+|-+$", "", word)
-            if word:
+            word = genre_map.get(re.sub(r"^-+|-+$", "", word), re.sub(r"^-+|-+$", "", word))
+            if word and word not in {"movie", "film", "serial", "unknown", "nomalum"}:
                 tags.append(f"#{word}")
 
     unique: List[str] = []
@@ -578,19 +627,15 @@ def _normalize_ai_metadata(raw: Any) -> Dict[str, str]:
             if value is not None and clean_text_output(value):
                 meta[key] = value
 
-    meta["title"] = clean_text_output(meta.get("title")) or AI_DEFAULT_METADATA["title"]
+    raw_title = clean_text_output(meta.get("title"))
+    meta["title"] = normalize_detected_title(raw_title) if raw_title else AI_DEFAULT_METADATA["title"]
     meta["countries"] = normalize_country(meta.get("countries"))
-    meta["year"] = clean_text_output(meta.get("year")) or AI_DEFAULT_METADATA["year"]
+    meta["year"] = normalize_year(meta.get("year"), raw_title)
     meta["rating"] = clean_text_output(meta.get("rating")) or AI_DEFAULT_METADATA["rating"]
     meta["genres"] = normalize_genres(meta.get("genres"))
     meta["director"] = normalize_director(meta.get("director"))
     meta["cast"] = normalize_cast(meta.get("cast"))
-
-    desc = clean_text_output(meta.get("description"))
-    desc_lines = [line.strip() for line in desc.splitlines() if line.strip()]
-    if not desc_lines:
-        desc_lines = AI_DEFAULT_METADATA["description"].splitlines()
-    meta["description"] = "\n".join(desc_lines[:4])
+    meta["description"] = normalize_description(meta.get("description"), meta["title"])
     return {key: str(value) for key, value in meta.items()}
 
 
@@ -664,11 +709,11 @@ def verify_metadata_confidence(metadata: Dict[str, str], reference: Optional[Dic
         ref = _normalize_ai_metadata(reference)
         if ref.get("year") != AI_DEFAULT_METADATA["year"] and meta.get("year") != AI_DEFAULT_METADATA["year"] and ref.get("year") != meta.get("year"):
             return "low"
-    if known >= 3:
+    if known >= 3 and meta.get("description") != AI_DEFAULT_METADATA["description"]:
         return "high"
     if known >= 1:
         return "medium"
-    return "medium"
+    return "low"
 
 
 async def admin_preview_if_uncertain(call: types.CallbackQuery, session_data: Dict[str, Any]) -> None:
@@ -861,11 +906,14 @@ async def _openai_poster_metadata(image_data_url: str) -> Tuple[Optional[Dict[st
         return None, "OPENAI_API_KEY Railway Variables ichida topilmadi. AI Vision ishlamadi."
 
     prompt = (
-        "Poster rasmdagi film/serialni aniqlang. Faqat JSON qaytaring. "
+        "Poster rasmdagi film/serialni maksimal aniqlikda aniqlang. Faqat JSON qaytaring, izoh yozmang. "
         "Kalitlar: title, countries, year, rating, genres, director, cast, description. "
-        "title faqat asosiy nom bo'lsin: subtitr, sifat, treyler, yil, qism, mavsum, reklama so'zlarini olib tashlang. "
-        "countries davlat nomlari normal yozilsin. genres hashtag ko'rinishida bo'lsin. "
-        "cast faqat aktyorlar ismlari bo'lsin. description 3-4 qatorlik o'zbekcha, spoilersiz bo'lsin. "
+        "title faqat asosiy nom bo'lsin: subtitr, sifat, treyler, poster, HD/4K, uzbekcha, qism, mavsum, reklama so'zlari va yilni olib tashlang. "
+        "year faqat film/serialning haqiqiy chiqarilgan yili bo'lsin; poster dizayni yoki kanal sanasiga ishonmang, shubhali bo'lsa Noma'lum. "
+        "countries faqat ishonchli ishlab chiqaruvchi davlatlar bo'lsin; USA/America bo'lsa AQSH deb yozing, spam davlat qo'shmang. "
+        "genres o'zbekcha hashtaglarda bo'lsin: action=#jangari, crime=#jinoyat, thriller=#triller, drama=#drama, sci-fi=#fantastika, horror=#qorqinchli. "
+        "director va cast faqat tozalangan ism-familiyalar bo'lsin. rating mavjud bo'lmasa Noma'lum. "
+        "description 2-4 qatorli, to'liq o'zbekcha, professional, real syujetga mos, spoilersiz synopsis bo'lsin; generic yoki sun'iy gap yozmang. "
         "Aniq bo'lmagan maydonlarga Noma'lum yozing."
     )
     payload = {
@@ -874,7 +922,7 @@ async def _openai_poster_metadata(image_data_url: str) -> Tuple[Optional[Dict[st
             "role": "user",
             "content": [
                 {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": image_data_url, "detail": "low"},
+                {"type": "input_image", "image_url": image_data_url, "detail": "high"},
             ],
         }],
         "text": {"format": {"type": "json_object"}},
@@ -1335,9 +1383,12 @@ def autopost_edit_kb():
 
 def settings_menu_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("✏️ Tahrirlash", "🗑 O‘chirish")
+    kb.row("📦 Kino backup")
+    kb.row("♻️ Kino restore")
     kb.row("📣 Kanalga yuborish")
     kb.row("📭 Kanalga yuborilmaganlar")
-    kb.row("❌ Bekor qilish")
+    kb.row("🔙 Ortga")
     return kb
 
 
@@ -2763,6 +2814,17 @@ async def recheck(call: types.CallbackQuery):
         await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz 😕", show_alert=True)
 
 # ================== KANALGA YUBORILMAGANLAR ==================
+@dp.message_handler(lambda m: m.text == "🔙 Ortga", state="*")
+async def settings_back_btn(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.finish()
+        await message.answer("❎ Bekor qilindi", reply_markup=user_menu())
+        return
+
+    await state.finish()
+    await message.answer("🔙 Ortga", reply_markup=admin_menu())
+
+
 @dp.message_handler(lambda m: m.text == "⚙️ Sozlash")
 async def settings_btn(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
