@@ -1020,7 +1020,7 @@ def ai_poster_actions_kb(message_id: int) -> types.InlineKeyboardMarkup:
 def ai_trailer_kb(message_id: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("🎞 Treyler uchun post", callback_data=f"ai:trailer:{message_id}"),
+        types.InlineKeyboardButton("🎞 Treyler kanali uchun post", callback_data=f"ai:trailer:{message_id}"),
         types.InlineKeyboardButton("✍️ Qo‘lda yozaman", callback_data=f"ai:manual:trailer:{message_id}")
     )
     return kb
@@ -1035,6 +1035,15 @@ def ai_name_kb(message_id: int) -> types.InlineKeyboardMarkup:
     return kb
 
 
+def ai_video_actions_kb(message_id: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🎞 Treyler kanali uchun post", callback_data=f"ai:trailer:{message_id}"),
+        types.InlineKeyboardButton("📁 Nomlash", callback_data=f"ai:name:{message_id}")
+    )
+    return kb
+
+
 def ai_video_kb(message: types.Message) -> types.InlineKeyboardMarkup:
     caption = (message.caption or "").lower()
     ctype = _ai_content_type(message.chat.id)
@@ -1044,9 +1053,9 @@ def ai_video_kb(message: types.Message) -> types.InlineKeyboardMarkup:
         return ai_content_type_kb(message.message_id)
 
     if ctype == "movie":
-        return ai_name_kb(message.message_id)
+        return ai_video_actions_kb(message.message_id)
     if ctype == "series":
-        return ai_name_kb(message.message_id)
+        return ai_video_actions_kb(message.message_id)
 
     return ai_content_type_kb(message.message_id)
 
